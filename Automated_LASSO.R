@@ -2,7 +2,7 @@
 ##### Author: Ron Bar-Ad
 ##### Last Update: 01/05/2026
 ##### Description:
-# This is a script that reads a long-pivoted CSV and fits ordinalNet and glmnet
+# This is a script that reads a CSV and fits ordinalNet and glmnet
 # cross-validated LASSO-penalty dimension reduction for each outcome on all
 # predictors, then verifies by fitting a mixed-effect ordinal regression.
 # The results are then exported to a word document with model details.
@@ -10,11 +10,19 @@
 # effect of participant ID, assuming data duplication in the pivot process. The
 # variable that was pivoted is called Environment, and is included as a fixed
 # effect predictor in all regression models to control its effect.
+# It is also designed to allow for multiple datasets, for example with and
+# without factor level pooling.
 ##### Note on use:
 # To adapt this script for a different long-pivoted dataset, search "Environment"
 # and replace all with the name of the pivot variable. Then change the outcomes
 # list, and the rest should work as-is.
+# To add more than one dataset, simply read the data in, prepare it however it
+# needs to be prepared, and add it to the list "datasets" (defined right before
+# the utility functions).
 ##### Process:
+# 1. Data preparation: remove factors with < 2 levels of meaningful frequency,
+#     pool factor levels with neighbours where they fall under the frequency
+#     threshold, calculate SUS usability score and TLX task load score.
 # 1. Fit glmnet LASSO with and without outcomes as potential predictors,
 #     verify with mixed effect ordinal regression clmm.
 # 2. Fit ordinalNet LASSO with and without outcomes as potential predictors,
@@ -37,23 +45,194 @@ library(ordinal) # for mixed effects ordinal regression clmm
 set.seed(20070830)
 
 # For import and export
-setwd("C:\\Data")
+setwd("C:\\Users\\ronba\\Nextcloud\\PhD\\Experiments_2-3\\")
 
 # Import merged data from Qualtrics and in-VR questionnaire
-data.all <- read_csv("Data.csv")
+data.all <- read_csv("C:\\Users\\ronba\\Nextcloud\\PhD\\Experiments_2-3\\Data\\!MasterData.csv")
 
-# Remove unnecessary information:
-##    Anything qualitative (___Other, Qual___);
-##    Anything empty (ExpStudUnsure, LivedExpEarlyNon, LivedExpEarlyUnsure,
-###      LivedExpLateNon, LivedExpLateUnsure).
-data.quant <- subset(data.all, select=-c(ExpWorkOther, ExpWorkPlanAndOther,
-                                         ExpStudUnsure, ExpStudOther, ExpStudUniOther,
-                                         ExpStudCurrentOther, LivedExpEarlyNon, LivedExpEarlyUnsure,
-                                         LivedExpLateNon, LivedExpLateUnsure, QualProfessional,
-                                         QualResearch, QualGeneral))
+
+# Define our outcome variables, this will come in handy when running our Lasso
+outcomes <- c("Greenness", "Beauty", "Density", "Safety", "BuildingHeight", "RoadWidth")
+#outcomes <- c("UseScore", "TLXScore")
+
+
+
+# Define our continuous variables (do not mutate to factor)
+not_factor <- c("Age", "ExpWorkPlanYears", "ExpWorkOtherYears")
+
+# Define our wide-format outcome variables (so they aren't included in
+# factor level merging).
+for (col in colnames(data.all)) {
+  for (out in outcomes) {
+    if (endsWith(col, out)){
+      not_factor <- c(not_factor, col)
+    }
+  }
+}
+
 # Set nominal variables as factors
-data.quant <- data.quant %>% 
-  mutate_at(vars(-c(3,5,6,20:39, 43:60)), as.factor)
+# data.quant <- data.quant %>% 
+#   mutate_at(vars(-c(3,5,6,20:39, 43:60)), as.factor)
+data.quant <- data.all %>% mutate_at(vars(-any_of(not_factor)), as.factor)
+
+# Stick ID in there too.
+not_factor <- c(not_factor, "ID")
+
+
+# FACTOR LEVEL MERGING.
+
+# Set the minimum threshold for level frequency. Anything under this
+# is merged to avoid model confusion. Agresti (2007) suggests a threshold of 5,
+# Kuhn and Johnson (2019) suggest a 95:5 ratio. Since 5% of the sample in
+# this dataset is lower than 5, 5 is the default threshold.
+threshold <- 5
+# Empty list to be filled with columns to remove entirely. Any factor with
+# only 2 levels where one level has frequency < threshold is removed
+# or it will cause spurious correlations with no meaning.
+remove <- c()
+
+# Iterating through our columns, testing one by one if they should
+# be removed, pooled, or left as they are.
+for (col in colnames(data.quant)) {
+  
+  # Leave the non-factors (and outcome vars) alone
+  if (!col %in% not_factor) {
+    
+    # For readability.
+    tab <- table(data.quant[[col]])
+    
+    # If there's only one factor level, it's a useless variable,
+    # and can be removed.
+    if (length(tab) < 2) remove <- c(remove, col)
+    
+    # If there are only 2 levels and one is below the threshold, it will
+    # skew all analysis, but pooling would make it useless. It is therefore
+    # removed.
+    if (any(tab < threshold) & length(tab) < 3) {
+      remove <- c(remove, col)
+    } else {
+      
+      # If there are enough levels for pooling,
+      # Test if there are any levels with frequencies below the threshold,
+      # and pool them to their neighbours.
+      
+      # Loop count is set to the initial number of levels in the factor to
+      # ensure the loop doesn't get stuck at the bottom and never end.
+      count <- length(table(data.quant[[col]]))
+      
+      # Use a While loop so that number of levels is continually updated,
+      # where a for loop sets its parameters before it begins. 
+      while (any(table(data.quant[[col]]) < threshold & count > 0)) {
+        
+        # If we've pooled enough levels in past loops 
+        # that there's only 2 levels left and one of them is *still* < 5,
+        # this won't be a useful variable and we can remove it.
+        if (length(table(data.quant[[col]])) < 3) {
+          
+          remove <- c(remove, col)
+          # move on to next column
+          next
+        
+        # If there are levels to pool, we get to pooling.
+        } else {
+          
+          # Only bother looping through 1 at a time if there's more than 1
+          # level that's < threshold.
+          if (length(which(table(data.quant[[col]]) < threshold)) > 1) {
+            
+            # Start looping from last level.
+            level <- length(table(data.quant[[col]]))
+            
+            # Using a while loop to iterate backwards, ensuring
+            # that levels are all merged from one direction.
+            while (level > 1) {
+              
+              # For readability
+              tab <- table(data.quant[[col]])
+              
+              # If we're below the threshold, pool with smallest neighbour.
+              if (tab[level] < threshold) {
+                
+                # Return the lowest neighbour's index number, unless we're
+                # at the start or end, in which case we simply return the
+                # index of the only neighbour.
+                if (level == length(tab)) {
+                  neighbour <- level-1
+                } else if (level <= 1) {
+                  neighbour <- level+1
+                } else{
+                  # Don't ask me why it's a nested if I tried a bunch of other
+                  # stuff that didn't work for some reason.
+                  # Smallest neighbour's index is returned.
+                  if (tab[level-1] < tab[level+1]) neighbour <- level-1 else neighbour <- level+1
+                }
+                
+                # Both level names pasted together to form new level.
+                # E.g. if levels were 5 and 4, new level is 4&5.
+                to_merge <- names(tab[c(neighbour,level)])
+                new_level <- paste(to_merge, collapse="&")
+                # Replace both levels with new level.
+                levels(data.quant[[col]])[levels(data.quant[[col]]) %in% to_merge] <- new_level
+              }
+              # Move on to next levels in factor.
+              level <- level -1
+            }
+          # If there's only 1 level < threshold, we just find it and replace it
+          # with its smallest neighbour without all the loops and checks.
+          } else {
+            # For readability
+            tab <- table(data.quant[[col]])
+            # Set condition, will be true when index is collected.
+            found <- FALSE
+            # Iterator to go through the factor levels.
+            level <- 1
+            
+            # Look I know this one really didn't need to be a while loop, but
+            # I tried a bunch of other ways about this and none of them worked
+            # for reasons I did not understand. It's a while loop because that's
+            # the only way I got the index number to work.
+            while (!found) {
+              # If the level is below the threshold, that's our target.
+              if (tab[level] < threshold){
+                # Flip the condition, end the loop.
+                found <- TRUE
+              # If it's not our target, iterate onward.
+              } else {
+                level <- level +1
+              }
+            }
+            
+            # Find our smallest neighbour.
+            # If it's the first level, its only neighbour is +1.
+            if (level <= 1) {
+              neighbour <- level + 1
+            
+            # If it's the last level, its only neighbour is -1.
+            } else if (level >= length(tab)) {
+              neighbour <- level -1
+              
+            # If it's somewhere in the middle, we find the smallest of +/- 1.
+            } else {
+              if (tab[level+1] < tab[level-1]) neighbour <- level+1 else neighbour <- level-1
+            }
+            # Get the names of the levels.
+            to_merge <- names(tab[c(neighbour,level)])
+            # Paste them together, so that levels "5" and "4" become level "4&5".
+            new_level <- paste(to_merge, collapse="&")
+            # Replace old levels with new level.
+            levels(data.quant[[col]])[levels(data.quant[[col]]) %in% to_merge] <- new_level
+          }
+        }
+        # Onwards through the table.
+        count <- count - 1
+      }
+    }
+  }
+}
+
+# We now have a data.quant with pooled factor levels and a list of columns to
+# remove. We remove the columns.
+data.quant <- data.quant[,!colnames(data.quant) %in% remove]
 
 # Pivot data to long format
 ##   This will allow the use of Environment as a predictor with 3 levels
@@ -61,7 +240,16 @@ data.quant <- data.quant %>%
 ##   but will duplicate rows from Qualtrics responses.
 ##   Shouldn't affect models, since data proportions are  the same,
 ##   but may interfere in analysis that doesn't involve the in-VR questionnaires.
-data.long <- pivot_longer(data=data.quant, cols=43:60, names_to=c("Environment", ".value"), names_sep="_")
+to_pivot <- c()
+for (col in 1:length(data.quant)){
+  for (out in outcomes){
+    if (endsWith(colnames(data.quant)[col],out)){
+      to_pivot <- c(to_pivot, col)
+    }
+  }
+}
+
+data.long <- pivot_longer(data=data.quant, cols=all_of(to_pivot), names_to=c("Environment", ".value"), names_sep="_")
 
 # Set environment factor levels. 0 = no trees, 1 = 315 trees, 2 = 634 trees.
 data.long$Environment[data.long$Environment == "NT"] <- "0"
@@ -69,161 +257,48 @@ data.long$Environment[data.long$Environment == "ST"] <- "1"
 data.long$Environment[data.long$Environment == "MT"] <- "2"
 data.long$Environment <- as.factor(data.long$Environment)
 
-# Define our outcome variables, this will come in handy when running our Lasso
-outcomes <- c("Greenness", "Beauty", "Density", "Safety", "BuildingHeight", "RoadWidth")
-
-# Function getHighLowLinear:
-##   Returns a vector where all numeric values are divided into quartiles
-##   based on all possible values. e.g. a 2 on a 1-to-7 scale will be Low,
-##   even if all other values are 1 (which would also return Low).
-##   Arguments:
-###     col: vector, a dataframe column of numeric data
-###     minim: num, the lower bound of possible answers
-###     maxim: num, the upper bound of possible answers
-getHighLowLinear <- function(col, minim, maxim) {
-  
-  bounds <- c(minim, maxim)
-  
-  # Set low point at 1st quartile of possible answers
-  low_point <- summary(bounds)[["1st Qu."]]
-  # Set mid point at mean. With only min and max as data points,
-  # mean and median are the same.
-  mid_point <- summary(bounds)[["Mean"]]
-  # Set high point at 3rd quartile of possible answers.
-  high_point <- summary(bounds)[["3rd Qu."]]
-  
-  # Replace values. For each value in the vector,
-  # if it fits a given case, it is replaced by the given string,
-  # otherwise move on to next.
-  # If none match (impossible in this case), returns "Failed".
-  case_when(
-    # Up to 1st quartile is low
-    col <= low_point ~ "Low",
-    # 1st quartile to mean is midlow
-    col > low_point & col <= mid_point ~ "MidLow",
-    # mean to 3rd quartile is midhigh
-    col > mid_point & col <= high_point ~ "MidHigh",
-    # above 3rd quartile is high
-    col > high_point ~ "High",
-    # if this happens, something catastrophic has gone wrong.
-    TRUE ~ "Failed"
-  )
+##### Defining usability score from SUS.
+# divide into positive and negative
+pos <- c("UseFreq", "UseEasy", "UseInt", "UseQuick", "UseConf")
+neg <- c("UseComplex", "UseTech", "UseInc", "UseCumb", "UseLearn")
+# take only SUS columns
+data.use <- data.all[, colnames(data.all) %in% c(pos, neg)]
+# for positive columns subtract 1
+data.use[pos] <- lapply(
+  data.use[pos], function(x) ifelse(x>1,x-1,1))
+# for negative columns subtract from 5
+data.use[neg] <- lapply(
+  data.use[neg], function(x) 5-x)
+# score is the sum of all columns * 2.5, giving a range up to 100
+data.use <- data.use %>% mutate(UseScore = (UseFreq + UseEasy + UseInt + UseQuick +
+                                              UseConf + UseComplex + UseTech + UseInc +
+                                              UseCumb + UseLearn) * 2.5)
+# To prepare for long-pivot, we repeat each UseScore as many times as our pivot
+# increased the number of rows.
+use_score <- c()
+reps <- nrow(data.long) / nrow(data.use)
+for (i in 1:nrow(data.use)){
+  use_score <- c(use_score, rep(data.use$UseScore[i], reps))
+}
+##### Defining TLX score from NASA TLX
+data.tlx <- data.all[,startsWith(colnames(data.all), "Task")]
+data.tlx <- data.tlx %>% mutate(TLXScore = (((((1+TaskMental)+(1+TaskPhysical)+(1+TaskRush)
+                                               +(7-TaskAccom)+(1+TaskHard)+(1+TaskStress))/6)-1)/6)*99+1)
+# The same pivot repetition for TLX score
+tlx_score <- c()
+reps <- nrow(data.long) / nrow(data.tlx)
+for (i in 1:nrow(data.tlx)) {
+  tlx_score <- c(tlx_score, rep(data.tlx$TLXScore[i], reps))
 }
 
+# And bring them in.
+data.long <- data.long[,!colnames(data.long) %in% c(colnames(data.use), colnames(data.tlx))]
+data.long$UseScore <- use_score
+data.long$TLXScore <- tlx_score
 
-# Function getHighLowOnCurve:
-##   Returns a vector where all numeric values are divided into quartiles
-##   based on present values. e.g. a 2 on a 1-to-7 scale will be high
-##   if all other values are 1 (which would return Low).
-##   Arguments:
-###     col: vector, a dataframe column of numeric data
-##   Note: because this function relies on available data, it needs to handle
-##   different amounts of variance. getHighLowLinear always has four quartiles,
-##   but columns with no variance cannot be divided that way.
-getHighLowOnCurve <- function(col) {
-  
-  # Handling different levels of variance.
-  
-  # Less than 2 unique values, everything is Medium.
-  if (length(unique(col)) < 2) {
-    return (rep("Medium"), length(col))
-    
-  # Exactly 2 unique values, the lower one is Low and the higher one is High.
-  # values assigned string based on position in sorted version of vector.
-  } else if (length(unique(col)) == 2) {
-    case_when(col == sort(unique(col))[1] ~ "Low", col == sort(unique(col))[2] ~ "High", TRUE ~ "Failed")
-    
-  # Exactly 3 unique values, the lowest is Low, the middle is Medium, the highest is High.
-  # values assigned string based on position in sorted version of vector.
-  } else if (length(unique(col)) == 3) {
-    u <- sort(unique(col))
-    case_when(col == u[1] ~ "Low", col == u[2] ~ "Medium", col == u[3] ~ "High")
-    
-  # More than 3 values, we set quartiles and switch per case.
-  } else {
-    
-    # Set low point at 1st quartile of data
-    low_point <- summary(col)[["1st Qu."]]
-    # Set mid point at mean of data.
-    mid_point <- summary(col)[["Mean"]]
-    # Set high point at 3rd quartile of data
-    high_point <- summary(col)[["3rd Qu."]]
-    
-    # Replace values. For each value in the vector,
-    # if it fits a given case, it is replaced by the given string,
-    # otherwise move on to next.
-    # If none match (impossible in this case), returns "Failed".
-    case_when(
-      # Up to 1st quartile is low
-      col <= low_point ~ "Low",
-      # 1st quartile to mean is midlow
-      col > low_point & col <= mid_point ~ "MidLow",
-      # mean to 3rd quartile is midhigh
-      col > mid_point & col <= high_point ~ "MidHigh",
-      # above 3rd quartile is high
-      col > high_point ~ "High",
-      # if this happens, something catastrophic has gone wrong.
-      TRUE ~ "Failed"
-    )
-  }
-}
-
-
-# Define our high-low datasets
-
-data.preds <- data.long[,setdiff(colnames(data.long),c(outcomes, "ID"))]
-data.out   <- data.long[,setdiff(colnames(data.long), colnames(data.preds))]
-
-# hiloC is the data divided by quartiles of each column's values.
-# Apply function getHighLowOnCurve, but only to numeric columns,
-# then turn result into factor.
-data.hiloC <- lapply(data.preds, function(x) if (is.numeric(x)) {as.factor(getHighLowOnCurve(x))} else {as.factor(x)})
-# Make data frame for analysis.
-data.hiloC <- as.data.frame(data.hiloC)
-data.hiloC <- merge(data.hiloC, data.out)
-
-# Define the bounds for our different variables
-# Columns on a 1-7 scale
-Sevenpoint <- colnames(data.preds[,23:38])
-# Columns with a 1-5 scale
-Fivepoint <- colnames(data.preds[,19:22])
-# Continuous value columns, no upper bound.
-Continuous <- c("Age", "ExpWorkPlanYears", "ExpWorkOtherYears")
-
-# hiloL is the data divided by quartiles of possible values.
-# Apply function getHighLowLinear, but only to numeric columns.
-# Continuous columns with no limit (e.g. Age) are divided on a curve.
-data.hiloL <- as.data.frame(Map(function(x, nm) {
-  
-  # Likert scale questions get min value 1 and max 7
-  if (nm %in% Sevenpoint) {
-    as.factor(getHighLowLinear(x, 1, 7))
-  
-  # Five-point scale questions get min value 1 and max 5
-  } else if (nm %in% Fivepoint) {
-    as.factor(getHighLowLinear(x,1,5))
-  
-  # Continuous vars get separated on a curve
-  } else if (nm %in% Continuous) {
-    as.factor(getHighLowOnCurve(as.numeric(x)))
-  
-  # Outcomes are kept numeric
-  } else if (nm %in% outcomes) {
-    x
-    
-  # Anything non-numeric is kept as-is.  
-  } else {
-    as.factor(x)
-  }
-}, data.preds, names(data.preds)))
-data.hiloL <- merge(data.hiloL, data.out)
-
-# The 3 datasets to use. Will automatically loop through all 3.
-#datasets <- list ("data.long" = data.long)
+# The datasets to use. Will automatically loop through all.
 datasets <- list(
-  "data.long" = data.long,
-  "data.hiloC" = data.hiloC,
-  "data.hiloL" = data.hiloL
+  "data.long" = data.long
 )
 
 
@@ -277,7 +352,12 @@ calculate_model_snr <- function(model) {
   return(var_signal / var_noise)
 }
 
-
+# Function remove_intercepts:
+##   Handles output object of clmm, removes intercepts from coefficients matrix.
+##   Args:
+###     sum: matrix, the coefficients matrix of a clmm object summary.
+###     preds: vector (str), list of predictors to be kept in coefficients list,
+####       to identify intercepts.
 remove_intercepts <- function(sum, preds) {
   # Define iterator.
   i <- 1
@@ -332,6 +412,14 @@ remove_intercepts <- function(sum, preds) {
 # Export                                                                     #
 ##############################################################################
 
+# Function format_p:
+##   Formats p-values from long numerics or scientific notation to either
+##   3-digit numbers or a string of "< [threshold]" with whatever the threshold
+##   for p-values too small to care about it.
+##   Args:
+###     p: num, a p-value from some model.
+###     threshold: num, the minimum threshold below which p-values are just
+####       replaced with a string. Defaults to 0.01 to keep to 3 digits.
 format_p <- function(p, threshold = 0.01) {
   ifelse(p < threshold, 
          return(sprintf("< %.2f", threshold)),
@@ -344,7 +432,7 @@ format_p <- function(p, threshold = 0.01) {
 ##   Arguments:
 ###     results_list: list, contains results of all selected models;
 ###     output_file: str, name of file to export, default Automated_Report.docx,
-export_results <- function(results_list, output_file = "Automated_Report_LASSO.docx") {
+export_results <- function(results_list, output_file = "Automated_Report.docx") {
   
   # Initialising document
   doc <- read_docx()
@@ -397,9 +485,9 @@ export_results <- function(results_list, output_file = "Automated_Report_LASSO.d
         }
         
         # Add deviance and misclassification
-        devPct_txt <- fpar(paste("Optimal deviance percentage:",
-                                 round(res$devPct, 5)))
-        doc <- body_add_fpar(doc, devPct_txt, style = "Normal")
+        bic_txt <- fpar(paste("BIC:",
+                                 round(res$bic, 5)))
+        doc <- body_add_fpar(doc, bic_txt, style = "Normal")
         
         misclass_txt <- fpar(paste("Misclassification:", round(res$misclass, 4)))
         doc <- body_add_fpar(doc, misclass_txt, style = "Normal")
@@ -451,10 +539,14 @@ export_results <- function(results_list, output_file = "Automated_Report_LASSO.d
         }
         
         # Add lambda and cross-validation error
-        lambda_txt <- fpar(paste("Optimal Lambda:", round(res$lambda, 5)))
+        # if (is.character(res$lambda)) {
+        #   lambtxt <- strsplit(res$lambda,": ")[[1]][1]
+        #   lambnum <- as.numeric(strsplit(res$lambda, ": ")[[1]][2])
+        # }
+        lambda_txt <- fpar(round(res$lambda,3))
         doc <- body_add_fpar(doc, lambda_txt, style = "Normal")
         
-        cv_txt <- fpar(paste("Cross-Validated MSE:", round(res$cv_error, 4)))
+        cv_txt <- fpar(paste("Cross-validated error:", round(res$cv_error, 4)))
         doc <- body_add_fpar(doc, cv_txt, style = "Normal")
         
         # Add predictors list
@@ -737,20 +829,32 @@ get_lasso_results <- function(data.lasso, outcome_var, alpha.lasso = 1, nfolds =
   }
   
   
-  
   ########## 4. Return list of LASSO best model details.
   
   ##### 4.1. Refit linear regression of best model.
   
-  # Get best model performance.
-  lambda_opt <- cv_fit$lambda.min
   # Get best model predictors.
   coef_opt <- coef(cv_fit, s = "lambda.min")
+  coef_1se <- coef(cv_fit, s = "lambda.1se")
+  
+  
+  
+  opt_vars <- rownames(coef_opt)[-1][coef_opt[-1, 1] != 0]
+  ose_vars <- rownames(coef_1se)[-1][coef_1se[-1, 1] != 0]
   
   # Get names of predictors:
   ##   For factors converted to numeric level codes,
   ##   variable names are the original column names.
-  selected_vars <- rownames(coef_opt)[-1][coef_opt[-1, 1] != 0]
+  opt_vars <- rownames(coef_opt)[-1][coef_opt[-1, 1] != 0]
+  ose_vars <- rownames(coef_1se)[-1][coef_1se[-1, 1] != 0]
+  
+  if (length(opt_vars) > 5 & length(ose_vars[ose_vars != "Environment"]) > 0 & length(ose_vars) < length(opt_vars)){
+    selected_vars <- ose_vars
+    lambda_opt <- cv_fit$lambda.1se
+  } else {
+    selected_vars <- opt_vars
+    lambda_opt <- cv_fit$lambda.min
+  }
   
   # Only run linear regression if there are predictors to choose from.
   if (length(selected_vars) > 0) {
@@ -828,181 +932,6 @@ get_lasso_results <- function(data.lasso, outcome_var, alpha.lasso = 1, nfolds =
                 note = "LASSO selected no predictors"))
   }
 }
-
-# Function get_best_subset:
-##   Runs a best-subset selection to find the best-fit model,
-##   runs the model regression, and returns a list of significant predictors,
-##   effect sizes, p-values, and model details, all to be turned
-##   into a table later. Includes error handling.
-##   Arguments:
-###     data: dataframe, the dataset being analysed;
-###     outcome_var: str, the name of the variable being predicted;
-###     nvmax: num, the maximum size of subsets to consider, non-MIO best-subset
-####       selection is considered incalculable at > 30 predictors, therefore
-####       defaults to NULL, which causes error, value must be set in function call;
-###     method: str, which type of selection to use, default is forward as exhaustive
-####       is impossible with > 30 predictors;
-###     exclude_outcomes: bool, whether to exclude outcomes from predictors;
-###     all_outcomes, vector, contains column names of dependent variables.
-get_best_subset <- function(data.bs, outcome_var, nvmax = NULL, 
-                            method = "forward", alpha.bs = 0.5,
-                            exclude_outcomes = FALSE, all_outcomes = outcomes) {
-  
-  ########## 1. Find best-subset model.
-  
-  # Check if outcome variable is included in dataframe.
-  if (!(outcome_var %in% colnames(data.bs))) {
-    # If not, say so and exit function.
-    warning(paste("Outcome", outcome_var, "not found."))
-    return(NULL)
-  }
-  
-  # Get list of predictor variable names.
-  # If we're excluding outcomes as predictors, we use the list of all outcomes
-  # to create a list of column names excluding them. Otherwise, we use the
-  # name of the outcome we're looking to predict and exclude only it.
-  ifelse(exclude_outcomes, predictors <- setdiff(colnames(data.bs), all_outcomes), 
-         predictors <- setdiff(colnames(data.bs), outcome_var))
-  
-  if (length(predictors) == 0) {
-    warning(paste("No predictors available for", outcome_var, "after exclusions."))
-    return(NULL)
-  }
-  
-  # Create formula with all predictor names
-  form <- as.formula(paste(outcome_var, "~", paste(predictors, collapse = " + ")))
-  
-  # Try to find best subset.
-  ##   Pass arguments:
-  ###     form: formula, containing every predictor;
-  ###     data: dataframe, from args;
-  ###     nvmax: num, from args;
-  ###     method: str, from args;
-  ###     really.big: bool, TRUE dismisses warnings about long calculation time.
-  rs_fit <- tryCatch({
-    regsubsets(form, data = data.bs, 
-               nvmax = nvmax, 
-               method = method,
-               really.big = TRUE)
-    
-    # if failed, print error message and return empty list.
-  }, error = function(e) {
-    warning(paste("Failed to run regsubsets for", outcome_var, ":", e$message))
-    return(NULL)
-  })
-  
-  # If failed but no error, return empty list.
-  if (is.null(rs_fit)) {
-    warning("Outcome",outcome_var," regsubsets returned empty object.")
-    return(NULL)
-  } 
-  
-  
-  
-  ########## 2. Fit findings to linear regression.
-  
-  ##### 2.1. Set up to build formula.
-  
-  # The results of the best-subset selection
-  summ <- summary(rs_fit)
-  
-  # Find best model by AdjR2, CP, and BIC
-  best_indices <- c(
-    "Adj R-sq" = which.max(summ$adjr2),
-    "Cp"       = which.min(summ$cp),
-    "BIC"      = which.min(summ$bic)
-  )
-  
-  # Get the expanded variable names in the best-subset model,
-  # these will need to be mapped back to original column names.
-  expanded_names <- colnames(summ$which)
-  
-  ##### 2.2. Fit regressions for each metric's best model.
-  
-  # List to hold results.
-  results_list <- list()
-  
-  # Fit a different regression for each metric's best subset of predictors.
-  # Cycling through AdjR2, CP, and BIC.
-  # Uses iterator "metric" that just holds a num (0,1,2)
-  for (metric in names(best_indices)) {
-    
-    # Get which metric we're using
-    idx <- best_indices[metric]
-    
-    # Get the model's result for that metric
-    selected <- summ$which[idx, ]
-    
-    # Get the expanded variable names to later be mapped back.
-    # This is now the list of predictors for the metric: the best subset.
-    selected <- expanded_names[selected]
-    
-    # Remove intercept.
-    if ("(Intercept)" %in% selected){
-      selected <- selected[selected != "(Intercept)"]
-    }
-    
-    # If the model returned no predictors, fit a null model.
-    if (length(selected) == 0) {
-      model_formula <- paste(outcome_var, "~ 1")
-      fit <- lm(as.formula(model_formula), data = data.bs)
-      
-      # If the model did return predictors, get fit a model for them.
-    } else {
-      # Map factor level expanded variable names to original ones.
-      selected <- sapply(selected, map_to_original, original_names = predictors)
-      
-      # Multiple levels of one factor will create duplicates, remove them.
-      selected <- unique(selected)
-      
-      # Create formula from selected predictors.
-      model_formula <- as.formula(paste(outcome_var, "~", paste(selected, collapse = " + ")))
-      
-      # Try to fit the linear model.
-      fit <- tryCatch({
-        # Using the formula of predictors from the best-subset selection.
-        lm(model_formula, data = data.bs)
-        
-      # On failure, report warning and return null.
-      }, error = function(e) {
-        warning(paste("Failed to fit linear model:", model_formula, "\nError:", e$message))
-        return(NULL)
-      })
-
-      # If model fails with no error, return null.
-      if (is.null(fit)) {
-        warning(paste("Model", model_formula, "returned null."))
-        return(NULL)
-      }
-    }
-    
-    
-    
-    ########## 3. Return results in list to output as table.
-    
-    # Get only the predictors, effects, and p-values of significant predictors.
-    sig_coefs <- tidy(summary(fit)) %>%
-      filter(term != "(Intercept)", p.value < 0.05) %>%
-      dplyr::select(term, estimate, p.value)
-    
-    # Store result in list, to iterate to next metric.
-    results_list[[metric]] <- list(
-      formula = model_formula,
-      size = length(selected),
-      predictors = selected,
-      significant_df = sig_coefs
-    )
-  }
-  
-  # Return the results of the 3 metrics.
-  return(list(
-    outcome = outcome_var,
-    exclude_outcomes = exclude_outcomes,
-    dataset_name = deparse(substitute(data.bs)),
-    models = results_list
-  ))
-}
-
 
 # Function get_ordinal_net:
 ##   Runs an ordinal net to find the best-fit ordinal regression model,
@@ -1189,7 +1118,7 @@ get_ordinal_net <- function(data.on, outcome_var, exclude_outcomes = FALSE,
   ###     y: vector (int), outcome variable values
   ###     nFolds: num, number of cross-validation folds.
   ###     nFoldsCV: num, number of cross-validation folds used to tune lambda
-  ###     maxiterOut: num, max number of outer-loop iterations. set to 500 to
+  ###     maxiterOut: num, max number of outer-loop iterations. set to 2000 to
   ####       ensure precise deviance assessment
   ###     alpha: num, penalty for predictors. Set to 1 for LASSO penalty.
   on_fit <- tryCatch({
@@ -1197,7 +1126,8 @@ get_ordinal_net <- function(data.on, outcome_var, exclude_outcomes = FALSE,
     #              maxiterOut = 500, alpha = 1)
     ordinalNetTune(X, y, folds = row_folds, family = "cumulative",
                    link = "logit", penaltyFactors = penalties,
-                   parallelTerms = TRUE, nonparallelTerms = FALSE)
+                   parallelTerms = TRUE, nonparallelTerms = FALSE,
+                   maxiterOut = 2000)
     
     # If it fails, print error message and return empty list.
     # Word doc will have a blank page.
@@ -1234,16 +1164,32 @@ get_ordinal_net <- function(data.on, outcome_var, exclude_outcomes = FALSE,
   ##### 4.1. Refit ordinal regression of best model.
 
   
-  # find highest percentage of deviance explained
-  #bestdev <- which(on_fit$devPct == max(on_fit$devPct), arr.ind=TRUE)[1]
-  bestbic <- which.min(on_fit$fit$bic)
-  coef_mat <- on_fit$fit$coefs[bestbic,]
+  # find lowest BIC
+  
+  model_bic <- sort(on_fit$fit$bic)
+  bestbic <- which(on_fit$fit$bic == model_bic[1])
+  bic1se <- which(on_fit$fit$bic == model_bic[2])
+  
+  coef_opt <- on_fit$fit$coefs[bestbic,]
+  coef_1se <- on_fit$fit$coefs[bic1se,]
   
   # remove intercepts
-  coef_mat <- coef_mat[(on_fit$fit$nLev):length(coef_mat)]
+  coef_opt <- coef_opt[(on_fit$fit$nLev):length(coef_opt)]
+  coef_1se <- coef_1se[(on_fit$fit$nLev):length(coef_1se)]
   
   # get non-0 coefficients
-  selected <- unique(predictors[coef_mat != 0])
+  coef_opt <- unique(predictors[coef_opt != 0])
+  coef_1se <- unique(predictors[coef_1se != 0])
+  
+  if ((length(coef_opt) > 5 & length(coef_1se) > 0 & length(coef_1se) < length(coef_opt)) | length(coef_opt) < 1 & length(coef_1se) > 0) {
+    selected <- coef_1se
+    misclass <- on_fit$misclass[bic1se]
+    bic <- model_bic[2]
+  } else {
+    selected <- coef_opt
+    misclass <- on_fit$misclass[bestbic]
+    bic <- model_bic[1]
+  }
   
   # Make sure Environment is controlled as a fixed effect.
   if (!"Environment" %in% selected) selected <- c(selected, "Environment")
@@ -1293,9 +1239,9 @@ get_ordinal_net <- function(data.on, outcome_var, exclude_outcomes = FALSE,
   ##   significant_df: predictor effects and p-values
   ##   misclass: cross-validation by misclassification.
   return(list(method = "OrdinalNetCV", exclude_outcomes = exclude_outcomes, 
-              devPct = which.max(on_fit$devPct), selected_predictors = selected, 
+              bic = bic, selected_predictors = selected, 
               model_size = length(selected), formula = form, significant_df = summ,
-              misclass = on_fit$misclass[which.max(on_fit$devPct)]))
+              misclass = misclass))
 }
 
 
@@ -1307,10 +1253,6 @@ get_ordinal_net <- function(data.on, outcome_var, exclude_outcomes = FALSE,
 
 # A list that will hold results to be exported.
 all_results <- list()
-
-# Configuration for best-subset selection
-nvmax_limit <- 15  # Higher = slower to compute. >30 incalculable.
-method_to_use <- "forward"  # "exhaustive" is impossible with >30 predictors.
 
 # Get the maximum number of models generated.
 # We will iterate through each outcome in each dataset twice,
@@ -1378,14 +1320,14 @@ for (ds_name in names(datasets)) {
     all_results[[paste(ds_name, outcome, "LASSO", "WITHOUT", sep = "_")]] <- lasso_wo
     
     
-    ##### 1.2. Ordinal net with predictors as outcomes.
+    #### 1.2. Ordinal net with predictors as outcomes.
 
     for(o in outcomes) {
-      data.long[[o]] <- as.ordered(data.long[[o]])
+      ds[[o]] <- as.ordered(ds[[o]])
     }
 
     # Alpha = 1 for LASSO.
-    on_with <- get_ordinal_net(data.long, outcome, exclude_outcomes = FALSE,
+    on_with <- get_ordinal_net(ds, outcome, exclude_outcomes = FALSE,
                                folds.on = 5, all_outcomes = outcomes,
                                alpha.on = 1)
 
@@ -1394,7 +1336,7 @@ for (ds_name in names(datasets)) {
     ##### 1.4. Ordinal net without predictors as outcomes.
 
     # Alpha = 1 for LASSO.
-    on_wo <- get_ordinal_net(data.long, outcome, exclude_outcomes = TRUE,
+    on_wo <- get_ordinal_net(ds, outcome, exclude_outcomes = TRUE,
                              folds.on = 5, alpha.on = 1, all_outcomes = outcomes)
 
     all_results[[paste(ds_name, outcome, "ON", "WITHOUT", sep = "_")]] <- on_wo
