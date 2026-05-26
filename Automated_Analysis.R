@@ -34,16 +34,18 @@ library(flextable) # for presentation.
 ##############################################################################
 
 # Read in csv
-data.long <- read_csv("C:\\Data\\Long.csv")
+#data.use <- read_csv("C:\\Data\\Long.csv")
 
 # Define outcome variables
 outcomes <- c("Greenness", "Beauty", "Density", "Safety", "BuildingHeight", "RoadWidth")
 
 # Define predictors as anything that isn't an outcome
-predictors <- setdiff(colnames(data.long), outcomes)
+#predictors <- setdiff(colnames(data.use), outcomes)
+all_predictors <- colnames(data.use)
 
 # Remove ID and Environment from predictors, they will be controlled effects.
-predictors <- predictors[!predictors %in% c("ID", "Environment")]
+all_predictors <- all_predictors[all_predictors != "ID"]
+preds_no_env <- all_predictors[!all_predictors %in% c("ID", "Environment")]
 
 
 ##############################################################################
@@ -57,7 +59,7 @@ predictors <- predictors[!predictors %in% c("ID", "Environment")]
 ###   coefs: matrix, the coefficients matrix of a clmm summary object,
 ####     contains predictor names as row names, effect estimates and p-values.
 ###   preds: vector (str), list of predictors, which row names are compared to.
-remove_intercepts <- function(coefs, preds) {
+remove_intercepts <- function(coefs, preds = all_predictors) {
   # Define iterator.
   iterator <- 1
   
@@ -128,7 +130,7 @@ format_p <- function(p.val, threshold = 0.01) {
 ##  Args:
 ###   exp_name: str, coefficient name to be converted.
 ###   original_names: vector (str), list of predictors to compare to.
-map_to_original <- function(exp_name, original_names) {
+map_to_original <- function(exp_name, original_names = all_predictors) {
   
   # Names that are already fine get returned as they are.
   if (exp_name %in% original_names) return(exp_name)
@@ -154,7 +156,7 @@ map_to_original <- function(exp_name, original_names) {
 ###   out_var: str, the name of the outcome variable being predicted.
 ###   preds: vector (str), the names of predictors to be tested.
 ###   pr: vector (str), the names of all possible predictors (for calling map_to_original)
-pairwise <- function(out_var, preds, pr = predictors) {
+pairwise <- function(out_var, preds, pr = all_predictors) {
   
   # Start our loop at preds[2] so we can pair it up with preds[1]
   innerLoop <- 2
@@ -167,7 +169,7 @@ pairwise <- function(out_var, preds, pr = predictors) {
   while (innerLoop <= length(preds)) {
     
     # Progress report expressed as %age of loops to run.
-    cat(paste(out_var,":",(innerLoop/length(preds))*100,"%"))
+    cat(paste(out_var,":", round((innerLoop/length(preds))*100,3),"%\n"))
     
     # Create an ordinal regression formula using two predictors.
     form <- paste("as.ordered(",out_var,") ~",preds[innerLoop-1], "+", preds[innerLoop])
@@ -183,7 +185,7 @@ pairwise <- function(out_var, preds, pr = predictors) {
     }
     
     # Fit ordinal regression with mixed effects.
-    fit <- clmm(as.formula(form), data.long)
+    fit <- clmm(as.formula(form), data.use)
     
     # Make sure environment included in predictors list,
     # for map_to_original to work.
@@ -254,6 +256,16 @@ pairwise <- function(out_var, preds, pr = predictors) {
 }
 
 
+fit_clmm <- function(var, preds, df){
+  # Make sure environment is not included, to account for it as fixed effect.
+  if ("Environment" %in% preds) preds <- preds[preds != "Environment"]
+  # Build our mixed effect formula with environment as fixed effect.
+  form <- paste("as.ordered(",var,") ~",paste(sig_preds, collapse=" + "), "+ Environment + (1 | ID)")
+  # Fit the model to the formula
+  fit <- clmm(as.formula(form), df)
+  # Return the model coefficients
+  return(summary(fit))
+}
 ##############################################################################
 # Automation                                                                 #
 ##############################################################################
@@ -265,160 +277,77 @@ pairwise <- function(out_var, preds, pr = predictors) {
 
 # Progress tracking.
 start.1 <- Sys.time()
-cat("1. ----- Started automation. ------")
+cat("1. ----- Started automation. ------\n")
 
-# Creating a copy so we don't touch our original data.
-data.test <- data.long
 # Empty list to be filled with significant results.
-results <- list()
+data.pair <- data.frame(matrix(nrow=0,ncol=5))
+colnames(data.pair) <- c("Outcome", "Predictor", "Effect", "P.value", "AIC")
 
 # Outer loop: iterating through the outcomes.
 for (i in 1:length(outcomes)) {
   
   # Progress update.
-  cat(paste("Generating univariate models,", (i/length(outcomes)*100), "% done."))
+  cat(paste("Generating univariate models,", round((i/length(outcomes)*100),3), "% done.\n"))
   
-  # Empty list per outcome to be filled with significant results.
-  res_out <- list()
-  
-  # For readability, instead of typing data.test[[outcomes[[i]]]] every time.
+  # For readability, instead of typing data.use[[outcomes[[i]]]] every time.
   out <- outcomes[i]
   
+  # Make sure predictors do not include outcome variable.
+  preds_no_env <- setdiff(colnames(data.use), c("ID", "Environment", outcomes))
+  all_predictors <- setdiff(colnames(data.use), c("ID", outcomes))
+  
   # Make sure our outcome variable is treated as ordinal.
-  data.test[[out]] <- as.ordered(data.test[[out]])
+  data.use[[out]] <- as.ordered(data.use[[out]])
   
   # Inner loop: iterating through the predictors per outcome.
-  for (j in 1:length(predictors)) {
+  for (pred.j in 1:length(preds_no_env)) {
     
     # For readability.
-    pred <- predictors[j]
+    pred <- preds_no_env[pred.j]
+    
+    # Skip if the predictor being estimated is Environment (always fixed),
+    # ID (always random effect) or somehow the predictor.
+    if (pred %in% c("ID", "Environment", out)) next
     
     # Put together a formula with the outcome and predictor, accounting
     # for the fixed effect of Environment and the random effect of ID.
     form <- paste(out, "~", pred, "+ Environment + (1 | ID)")
     
     # Fit a mixed effects ordinal regression to the formula.
-    model <- clmm(formula = form, data = data.test)
+    model <- clmm(formula = form, data = data.use)
     
     # Check we actually have results, otherwise skip to next.
-    if (!is.null(summary(model)$coefficients)) {
-      
-      # Make sure Environment is included in list of predictors for
-      # remove_intercepts otherwise it would be missed out.
-      if (!"Environment" %in% predictors) {pr <- c(predictors, "Environment")} else {pr <- predictors}
+    if (!is.null(summary(model)$coefficients) & !any(is.na(summary(model)$coefficients[,4]))) {
       
       # Removing intercepts for just predictors.
-      sigs <- remove_intercepts(summary(model)$coefficients, pr)
+      sigs <- remove_intercepts(summary(model)$coefficients, all_predictors)
       
       # If there's anything other than intercepts, we keep the predictor
       # names, effect estimates, and p.values.
       if (nrow(sigs) > 0){
-        sigs <- data.frame(
-          term = row.names(sigs),
-          estimate = round(sigs[,1],2),
-          p.value = format_p(sigs[,4]),
-          row.names = NULL
-        )
         
         # Only keep significant findings.
-        sigs <- sigs[sigs$p.value < 0.05,]
+        sigs <- sigs[sigs[,4] < 0.05,]
         
         # If there are any, save them as results.
-        if (nrow(sigs) > 0) {
-          res_out[[j]] <- sigs
+        if (nrow(sigs[!startsWith(row.names(sigs), "Environment"),]) > 0) {
+          for (row in row.names(sigs)){
+            data.pair[nrow(data.pair)+1,] <- c(out, row, round(sigs[row,1], 2),
+                                               format_p(sigs[row,4]), 
+                                               model$info["AIC"])
+          }
         }
       }
     }
   }
-  # The results for this outcome are saved, then cleared when the loop starts
-  # again for the next one.
-  results[[i]] <- res_out
 }
 
 # Progress update.
 end <- Sys.time()
-cat(paste("1. ------ Univariate models complete.", end-start.1, "-----"))
+cat(paste("1. ------ Univariate models complete. Time taken in seconds:", round(end-start.1,3), "-----\n"))
 
-##### 2. Transform into data frame.
 
-# First step is to convert the results of the last step into a dataframe
-# for regression analysis.
-
-# Progress tracking.
-start <- Sys.time()
-cat("2. ----- Transforming results into data frame. -----")
-
-# Fresh data frame for step 2, 0 rows to start, they'll be added later.
-data.pair <- data.frame(matrix(nrow=0,ncol = 4))
-# 4 columns to store regression results: Outcome ~ Predictor (estimate, p-value)
-colnames(data.pair) <- c("outcome", "predictor", "estimate", "p.value")
-
-# Iterate through each outcome variable's list of models from step 1
-# to fill data.pair.
-for (pair.i in 1:length(results)) {
-  
-  # Progress update.
-  cat(paste("Creating data frame:", (pair.i/length(results))*100, "% done."))
-  
-  # New list of predictors for every model generated.
-  terms <- c()
-  # New list of effect estimates for every model generated.
-  est <- c()
-  # New list of p-values for every model generated.
-  p <- c()
-  
-  # For each model fitted to the outcome, get its coefficients, effects, and
-  # p-values appended to the list.
-  for (pair.j in results[[pair.i]]) {
-    terms <- c(terms, pair.j$term)
-    est <- c(est, pair.j$estimate)
-    p <- c(p, pair.j$p.value)
-  }
-  
-  # Now we have the number of rows for the outcome (1 row per term per model)
-  # so we can fill the Outcome column with this outcome's name that many times 
-  out <- c(rep(outcomes[pair.i],length(terms)))
-  
-  # If by some chance the number of rows we got doesn't match the number of
-  # estimates, give a warning and skip this outcome's models.
-  if (length(out) != length(est)){
-    warning(paste(outcomes[pair.i], "difference between outcomes and estimates is",
-                  length(out)-length(est)))
-    next
-  # Same goes for if the number of rows doesn't match the number of p-values.
-  } else if (length(out) != length(p)) {
-    warning(paste(outcomes[pair.i], "difference between outcomes and p-values is",
-                  length(out)-length(p)))
-    next
-  # And, really unlikely since we got the number of rows from the number of
-  # terms, but if they don't match, skip this loop iteration.
-  } else if (length(out) != length(terms)) {
-    warning(paste(outcomes[pair.i], "difference between outcomes and predictors is",
-                  length(out)-length(p)))
-    next
-  
-  # If all the values match up, let's assemble our data frame.
-  } else {
-    
-    # We pick up right after the last row in the data frame,
-    # on first loop nrow(data.pair) will be 0, so where will be 1.
-    where <- nrow(data.pair)+1
-    
-    # Fill the dataframe for as many rows as we have with the data
-    # per row. Starting at +1 the last row, ending after all our rows
-    # are inserted.
-    data.pair[where:(where+length(out)-1),] <- c(out, terms, est, p)
-  }
-}
-
-# Make sure we're only using significant results from step 1.
-data.pair <- data.pair[data.pair$p.value < 0.05,]
-
-# Progress update.
-end <- Sys.time()
-cat(paste("2. ----- Data frame created.", end-start, "-----"))
-
-##### 3. Pairwise and multivariate regression.
+##### 2. Pairwise and multivariate regression.
 
 # We'll loop through each outcome, for each of its significant predictors,
 # and pair them up at random a few times, leaving only the predictors that
@@ -427,29 +356,27 @@ cat(paste("2. ----- Data frame created.", end-start, "-----"))
 
 # Progress tracking.
 start <- Sys.time()
-cat("3. ----- Fitting pairwise regressions. -----")
+cat("2. ----- Fitting pairwise regressions. -----\n")
 
 # Fresh new data frame for the final results.
-sig <- data.frame(matrix(nrow=0,ncol = 4))
+sig <- data.frame(matrix(nrow=0,ncol = 5))
 # Give it the 4 column names we'll be reporting.
 colnames(sig) <- colnames(data.pair)
 
-# Make sure that we have a list of predictors that include environment
-# so it doesn't get skipped.
-if (! "Environment" %in% predictors) {pr <- c(predictors, "Environment")} else {pr <- predictors}
+all_predictors <- setdiff(colnames(data.use),"ID")
+preds_no_env <- setdiff(colnames(data.use), c("ID", "Environment"))
 
 # Outer loop: for each outcome, we fit as many pairwise models as there are
 # variable pairs, repeating the process up to 5 times or until there are < 3
 # predictors in the model.
 for (var in outcomes) {
-  
   # Progress update.
-  cat(paste("Fitting pairwise models", (outcomes[[var]]/length(outcomes))*100,
-            "% done."))
+  cat(paste("Fitting pairwise models", round((which(outcomes == var)/length(outcomes))*100,3),
+            "% done.\n"))
   
   # Get the predictors for this outcome as a list of original predictor names.
   sig_preds <- sapply(data.pair$predictor[data.pair$outcome == var], function(x){
-    map_to_original(x,pr)})
+    map_to_original(x,all_predictors)})
   # Get rid of duplicates and headers.
   sig_preds <- unique(sig_preds)
   
@@ -468,46 +395,56 @@ for (var in outcomes) {
     # to slip through the cracks in pairwise (see comments above).
     sig_preds <- sample(sig_preds)
     # Run the two-predictor regressions.
-    sig_preds <- pairwise(var, sig_preds, pr)
+    sig_preds <- pairwise(var, sig_preds, all_predictors)
     # Keep the loop moving.
     loop <- loop-1
   }
   
   # Progress update.
-  cat(paste("Fitting multivariate model for", var))
+  cat(paste("Fitting multivariate model for", var,".\n"))
   
-  # Really make sure environment is included to account for it as fixed effect.
-  if (! "Environment" %in% sig_preds) sig_preds <- c(sig_preds, "Environment")
-  
-  # Build our mixed effect formula.
-  form <- paste("as.ordered(",var,") ~",paste(sig_preds, collapse=" + "), "+ (1 | ID)")
+  # Make sure environment is not included, to account for it as fixed effect.
+  if ("Environment" %in% sig_preds) sig_preds <- sig_preds[sig_preds != "Environment"]
   
   # Fit the final multivariate mixed effect ordinal regression for the outcome.
-  fit <- clmm(as.formula(form), data.long)
-  
   # Get rid of the intercepts so we only have predictors to report.
-  summ <- remove_intercepts(summary(fit)$coefficients, pr)
   
-  # Only keep significant predictors in the new model.
-  summ <- summ[summ[,4] < 0.05,]
+  summ <- fit_clmm(var, sig_preds, data.use)
+  aic <- summ$info["AIC"]
+  summ <- remove_intercepts(summ$coefficients, all_predictors)
   
-  # If there are none, there's no point adding anything to the new data frame,
-  # and this last step gets skipped.
-  if (nrow(summ) > 0) {
+  tries <- length(sig_preds)
+  while (any(is.na(summ[,4])) & tries > 0) {
+    summ <- fit_clmm(var, sig_preds[-c(tries)], data.use)
+    aic <- summ$info["AIC"]
+    summ <- remove_intercepts(summ$coefficients, all_predictors)
+    tries <- tries - 1
+  }
+  
+  if (!any(is.na(summ[,4]))) {
+  
+    # Only keep significant predictors in the new model.
+    summ <- summ[summ[,4] < 0.05,]
     
-    # For each coefficient we'll report, add a new row to the data frame.
-    for (co in row.names(summ)) {
-      # We add a row with the outcome variable, the predictor, the effect, and
-      # the p-value.
-      sig[nrow(sig)+1,] <- c(var, co, round(summ[co,1],2),format_p(summ[co,4]))
+    # If there are none, there's no point adding anything to the new data frame,
+    # and this last step gets skipped.
+    if (nrow(summ) > 0) {
+      
+      # For each coefficient we'll report, add a new row to the data frame.
+      for (co in row.names(summ)) {
+        # We add a row with the outcome variable, the predictor, the effect, and
+        # the p-value.
+        sig[nrow(sig)+1,] <- c(var, co, round(summ[co,1],2),format_p(summ[co,4]),aic)
+      }
     }
   }
 }
 
 # Final progress report.
 end <- Sys.time()
-cat(paste("3. ----- Pairwise and multivariate finished.", end-start, "-----"))
-cat(paste("All finished! Total time taken was:", end-start.1))
+cat(paste("2. ----- Pairwise and multivariate finished. Time taken in seconds:", round(end-start,3), "-----\n"))
+cat(paste("All finished! Total time taken was: Time taken in seconds:", round(end-start.1,3), ".\n"))
 
+# Display final results as flextable.
 flextable(sig) %>% theme_vanilla() %>%
   set_caption("Significant predictors per outcome.")
